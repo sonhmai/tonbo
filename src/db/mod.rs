@@ -43,6 +43,8 @@ pub use error::DBError;
 pub use scan::{DEFAULT_SCAN_BATCH_ROWS, ScanBuilder, ScanSetupProfile};
 pub(crate) use wal::{TxnWalPublishContext, WalFrameRange};
 
+#[cfg(not(test))]
+use crate::observability::log_warn;
 pub use crate::{
     compaction::{
         metrics::{
@@ -112,7 +114,11 @@ pub struct Version {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WritePathProfile {
     partition_ns: u64,
+    wal_append_submit_ns: u64,
+    wal_append_wait_ns: u64,
     wal_append_ns: u64,
+    wal_commit_submit_ns: u64,
+    wal_commit_wait_ns: u64,
     wal_commit_ns: u64,
     mutable_insert_ns: u64,
     seal_ns: u64,
@@ -126,9 +132,29 @@ impl WritePathProfile {
         self.partition_ns
     }
 
+    /// Time spent submitting WAL append payloads to the writer.
+    pub fn wal_append_submit_ns(&self) -> u64 {
+        self.wal_append_submit_ns
+    }
+
+    /// Time spent waiting for WAL append payload durable acks.
+    pub fn wal_append_wait_ns(&self) -> u64 {
+        self.wal_append_wait_ns
+    }
+
     /// Time spent appending write payloads to the WAL and waiting for durable acks.
     pub fn wal_append_ns(&self) -> u64 {
         self.wal_append_ns
+    }
+
+    /// Time spent submitting the WAL commit marker to the writer.
+    pub fn wal_commit_submit_ns(&self) -> u64 {
+        self.wal_commit_submit_ns
+    }
+
+    /// Time spent waiting for the WAL commit marker durable ack.
+    pub fn wal_commit_wait_ns(&self) -> u64 {
+        self.wal_commit_wait_ns
     }
 
     /// Time spent writing the WAL commit marker and waiting for durability.
@@ -161,7 +187,19 @@ impl WritePathProfile {
     pub fn saturating_add(self, other: Self) -> Self {
         Self {
             partition_ns: self.partition_ns.saturating_add(other.partition_ns),
+            wal_append_submit_ns: self
+                .wal_append_submit_ns
+                .saturating_add(other.wal_append_submit_ns),
+            wal_append_wait_ns: self
+                .wal_append_wait_ns
+                .saturating_add(other.wal_append_wait_ns),
             wal_append_ns: self.wal_append_ns.saturating_add(other.wal_append_ns),
+            wal_commit_submit_ns: self
+                .wal_commit_submit_ns
+                .saturating_add(other.wal_commit_submit_ns),
+            wal_commit_wait_ns: self
+                .wal_commit_wait_ns
+                .saturating_add(other.wal_commit_wait_ns),
             wal_commit_ns: self.wal_commit_ns.saturating_add(other.wal_commit_ns),
             mutable_insert_ns: self
                 .mutable_insert_ns
@@ -503,7 +541,19 @@ where
 
     /// Ingest a RecordBatch into the database (auto-commit mode).
     pub async fn ingest(&self, batch: RecordBatch) -> Result<(), DBError> {
-        self.inner.ingest(batch).await.map_err(DBError::Key)
+        #[cfg(test)]
+        {
+            self.inner.ingest(batch).await.map_err(DBError::Key)
+        }
+        #[cfg(not(test))]
+        {
+            self.inner
+                .ingest_without_minor_compaction(batch)
+                .await
+                .map_err(DBError::Key)?;
+            DbInner::schedule_background_minor_compaction(Arc::clone(&self.inner));
+            Ok(())
+        }
     }
 
     /// Ingest a batch along with its tombstone bitmap, routing through the WAL when enabled.
@@ -515,10 +565,22 @@ where
         batch: RecordBatch,
         tombstones: Vec<bool>,
     ) -> Result<(), DBError> {
-        self.inner
-            .ingest_with_tombstones(batch, tombstones)
-            .await
-            .map_err(DBError::Key)
+        #[cfg(test)]
+        {
+            self.inner
+                .ingest_with_tombstones(batch, tombstones)
+                .await
+                .map_err(DBError::Key)
+        }
+        #[cfg(not(test))]
+        {
+            self.inner
+                .ingest_with_tombstones_without_minor_compaction(batch, tombstones)
+                .await
+                .map_err(DBError::Key)?;
+            DbInner::schedule_background_minor_compaction(Arc::clone(&self.inner));
+            Ok(())
+        }
     }
 
     /// Ingest a batch and return a write-path timing breakdown.
@@ -527,10 +589,23 @@ where
         batch: RecordBatch,
         tombstones: Vec<bool>,
     ) -> Result<WritePathProfile, DBError> {
-        self.inner
-            .ingest_with_tombstones_with_profile(batch, tombstones)
-            .await
-            .map_err(DBError::Key)
+        #[cfg(test)]
+        {
+            self.inner
+                .ingest_with_tombstones_with_profile(batch, tombstones)
+                .await
+                .map_err(DBError::Key)
+        }
+        #[cfg(not(test))]
+        {
+            let profile = self
+                .inner
+                .ingest_with_tombstones_with_profile_without_minor_compaction(batch, tombstones)
+                .await
+                .map_err(DBError::Key)?;
+            DbInner::schedule_background_minor_compaction(Arc::clone(&self.inner));
+            Ok(profile)
+        }
     }
 
     /// Start building a scan query.
@@ -710,6 +785,12 @@ where
     flush_lock: AsyncMutex<()>,
     /// Optional minor compaction hook.
     minor_compaction: Option<MinorCompactionState>,
+    #[cfg(not(test))]
+    /// Single-flight guard for background minor compaction spawned from foreground writes.
+    minor_compaction_pending: AtomicBool,
+    #[cfg(not(test))]
+    /// Sticky rerun flag set when writes arrive while a background minor compaction is active.
+    minor_compaction_rerun: AtomicBool,
     /// Optional L0 backpressure configuration for ingest and minor compaction.
     l0_backpressure: Option<L0BackpressureConfig>,
     l0_stats_cache: AsyncMutex<L0StatsCache>,
@@ -775,6 +856,12 @@ where
     flush_lock: AsyncMutex<()>,
     /// Optional minor compaction hook.
     minor_compaction: Option<MinorCompactionState>,
+    #[cfg(not(test))]
+    /// Single-flight guard for background minor compaction spawned from foreground writes.
+    minor_compaction_pending: AtomicBool,
+    #[cfg(not(test))]
+    /// Sticky rerun flag set when writes arrive while a background minor compaction is active.
+    minor_compaction_rerun: AtomicBool,
     /// Optional L0 backpressure configuration for ingest and minor compaction.
     l0_backpressure: Option<L0BackpressureConfig>,
     l0_stats_cache: AsyncMutex<L0StatsCache>,
@@ -907,6 +994,10 @@ where
             compaction_metrics: None,
             flush_lock: AsyncMutex::new(()),
             minor_compaction: None,
+            #[cfg(not(test))]
+            minor_compaction_pending: AtomicBool::new(false),
+            #[cfg(not(test))]
+            minor_compaction_rerun: AtomicBool::new(false),
             l0_backpressure: None,
             l0_stats_cache: AsyncMutex::new(L0StatsCache::new(now)),
             l0_stats_refreshing: AtomicBool::new(false),
@@ -1003,7 +1094,24 @@ where
     }
 
     /// Unified ingestion entry point for dynamic batches.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn ingest(&self, batch: RecordBatch) -> Result<(), KeyExtractError> {
+        self.ingest_impl(batch, true).await
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn ingest_without_minor_compaction(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<(), KeyExtractError> {
+        self.ingest_impl(batch, false).await
+    }
+
+    async fn ingest_impl(
+        &self,
+        batch: RecordBatch,
+        run_minor_compaction: bool,
+    ) -> Result<(), KeyExtractError> {
         if self.schema.as_ref() != batch.schema().as_ref() {
             return Err(KeyExtractError::SchemaMismatch {
                 expected: self.schema.clone(),
@@ -1038,11 +1146,13 @@ where
         }
         self.insert_into_mutable(batch, commit_ts)?;
         self.maybe_seal_after_insert()?;
-        self.maybe_run_minor_compaction().await.map_err(|err| {
-            KeyExtractError::Arrow(ArrowError::ComputeError(format!(
-                "minor compaction failed: {err}"
-            )))
-        })?;
+        if run_minor_compaction {
+            self.maybe_run_minor_compaction().await.map_err(|err| {
+                KeyExtractError::Arrow(ArrowError::ComputeError(format!(
+                    "minor compaction failed: {err}"
+                )))
+            })?;
+        }
         Ok(())
     }
 
@@ -1334,6 +1444,48 @@ where
         } else {
             Ok(None)
         }
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn schedule_background_minor_compaction(db: Arc<Self>)
+    where
+        E: 'static,
+    {
+        if db.minor_compaction.is_none() {
+            return;
+        }
+        if db
+            .minor_compaction_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            db.minor_compaction_rerun.store(true, Ordering::Release);
+            return;
+        }
+
+        let runtime = Arc::clone(&db.executor);
+        let db_for_task = Arc::clone(&db);
+        runtime.spawn(async move {
+            let result = db_for_task.maybe_run_minor_compaction().await;
+            let rerun = db_for_task
+                .minor_compaction_rerun
+                .swap(false, Ordering::AcqRel);
+            db_for_task
+                .minor_compaction_pending
+                .store(false, Ordering::Release);
+
+            if let Err(err) = result {
+                log_warn!(
+                    component = "compaction",
+                    event = "minor_compaction_background_failed",
+                    error = ?err,
+                );
+            }
+
+            if rerun {
+                Self::schedule_background_minor_compaction(db_for_task);
+            }
+        });
     }
 
     /// Plan and flush immutable segments into a Parquet-backed SSTable.
