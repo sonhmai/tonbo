@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     env,
     path::{Path, PathBuf},
     pin::Pin,
@@ -32,8 +32,9 @@ use thiserror::Error;
 use tokio::{runtime::Runtime, time::sleep};
 use tonbo::db::{
     AwsCreds, CompactionMetrics, CompactionMetricsSnapshot, CompactionOptions, CompactionStrategy,
-    DB, DBError, DbBuildError, DbBuilder, LeveledPlannerConfig, ObjectSpec, S3Spec,
-    ScanSetupProfile, SstSweepSummary, WalSyncPolicy,
+    DB, DBError, DbBuildError, DbBuilder, Expr, LeveledPlannerConfig, ObjectSpec, S3Spec,
+    ScalarValue, ScanSetupProfile, Snapshot as DbSnapshot, SstSweepSummary, Version as DbVersion,
+    WalSyncPolicy, WritePathProfile,
 };
 
 pub(crate) const BENCH_ID: &str = "compaction_local";
@@ -56,9 +57,15 @@ const DEFAULT_WRITE_FREQUENCY_PERIODIC_TICKS_MS: &[u64] = &[50, 200];
 const DEFAULT_ENABLE_READ_WHILE_COMPACTION: bool = true;
 const DEFAULT_ENABLE_WRITE_THROUGHPUT_VS_COMPACTION_FREQUENCY: bool = true;
 const DEFAULT_BACKEND: BenchBackend = BenchBackend::Local;
+const DEFAULT_SURFACE_LIGHT_SCAN_LIMIT: usize = 64;
+const DEFAULT_SURFACE_HEAVY_SCAN_LIMIT: usize = 512;
 const INGEST_RETRY_MAX_ATTEMPTS: usize = 8;
 const INGEST_RETRY_BACKOFF_BASE_MS: u64 = 10;
 const COMPACTION_QUIESCED_STABLE_POLLS: usize = 3;
+const SWMR_APPEND_SHARE_PCT: u64 = 50;
+const SWMR_OVERWRITE_SHARE_PCT: u64 = 35;
+const SWMR_FINGERPRINT_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const SWMR_FINGERPRINT_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 #[derive(Clone)]
 pub(crate) enum BenchmarkDb {
@@ -764,6 +771,10 @@ where
         self.probe.record_link(to);
         self.inner.link(from, to).await
     }
+
+    async fn exists(&self, path: &FusioPath) -> Result<bool, FusioError> {
+        self.inner.exists(path).await
+    }
 }
 
 impl<FS> FsCas for ProbedFs<FS>
@@ -839,6 +850,7 @@ pub(crate) struct ObjectStoreBenchConfig {
     pub(crate) access_key: String,
     pub(crate) secret_key: String,
     pub(crate) session_token: Option<String>,
+    pub(crate) s3_express: bool,
     pub(crate) prefix_base: String,
 }
 
@@ -878,6 +890,10 @@ impl ObjectStoreBenchConfig {
             .map_err(|err| format!("failed reading TONBO_S3_SECRET_KEY: {err}"))?;
         let endpoint = env::var("TONBO_S3_ENDPOINT").ok();
         let session_token = env::var("TONBO_S3_SESSION_TOKEN").ok();
+        let s3_express = matches!(
+            env::var("TONBO_BENCH_OBJECT_STORE_FLAVOR").ok().as_deref(),
+            Some("s3_express")
+        );
         let prefix_base =
             env::var("TONBO_BENCH_OBJECT_PREFIX").unwrap_or_else(|_| "tonbo-bench".to_string());
 
@@ -888,6 +904,7 @@ impl ObjectStoreBenchConfig {
             access_key,
             secret_key,
             session_token,
+            s3_express,
             prefix_base,
         })
     }
@@ -908,6 +925,7 @@ impl ObjectStoreBenchConfig {
         );
         s3.region = Some(self.region.clone());
         s3.endpoint = self.endpoint.clone();
+        s3.s3_express = Some(self.s3_express);
         s3.sign_payload = Some(true);
         ObjectSpec::s3(s3)
     }
@@ -1155,6 +1173,8 @@ pub(crate) enum ScenarioWorkload {
     ReadOnly,
     ReadWhileCompaction,
     WriteThroughput,
+    SwmrMixed,
+    Surface,
     SweepEstimate,
 }
 
@@ -1191,6 +1211,362 @@ impl WriteWorkloadState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SwmrReaderClass {
+    HeadLight,
+    HeadHeavy,
+    PinnedLight,
+    PinnedHeavy,
+}
+
+impl SwmrReaderClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::HeadLight => "head_light",
+            Self::HeadHeavy => "head_heavy",
+            Self::PinnedLight => "pinned_light",
+            Self::PinnedHeavy => "pinned_heavy",
+        }
+    }
+
+    fn is_pinned(self) -> bool {
+        matches!(self, Self::PinnedLight | Self::PinnedHeavy)
+    }
+
+    fn is_light(self) -> bool {
+        matches!(self, Self::HeadLight | Self::PinnedLight)
+    }
+
+    pub(crate) fn key_band(self) -> SwmrReaderKeyBand {
+        match self {
+            Self::HeadLight | Self::PinnedLight => SwmrReaderKeyBand::Hot,
+            Self::HeadHeavy | Self::PinnedHeavy => SwmrReaderKeyBand::Warm,
+        }
+    }
+
+    pub(crate) fn validation_model(self) -> SwmrReaderValidationModel {
+        match self {
+            Self::HeadLight => SwmrReaderValidationModel::CountAndKeyBand,
+            Self::HeadHeavy | Self::PinnedLight | Self::PinnedHeavy => {
+                SwmrReaderValidationModel::ExactShapeStable
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SwmrReaderKeyBand {
+    Hot,
+    Warm,
+}
+
+impl SwmrReaderKeyBand {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Hot => "hot-",
+            Self::Warm => "warm-",
+        }
+    }
+
+    fn contains_key(self, key: &str) -> bool {
+        key.starts_with(self.prefix())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SwmrReaderValidationModel {
+    ExactShapeStable,
+    CountAndKeyBand,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SwmrSetupDescriptor {
+    pub(crate) logical_target_bytes: u64,
+    pub(crate) estimated_row_bytes: u64,
+    pub(crate) estimated_preload_logical_bytes: u64,
+    pub(crate) estimated_steady_logical_bytes: u64,
+    pub(crate) payload_bytes: usize,
+    pub(crate) preload_batches: usize,
+    pub(crate) steady_batches: usize,
+    pub(crate) writer_batches_per_step: usize,
+    pub(crate) pinned_snapshot_mode: SwmrPinnedSnapshotMode,
+    pub(crate) pinned_snapshot_ts: u64,
+    pub(crate) pinned_manifest_version_ts: u64,
+    pub(crate) reader_count: usize,
+    pub(crate) light_scan_limit: usize,
+    pub(crate) heavy_scan_limit: usize,
+    pub(crate) held_snapshot_expectations: Vec<SwmrReaderExpectationArtifact>,
+    pub(crate) manifest_reconstruction_observations: Vec<SwmrReaderObservationArtifact>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SwmrWorkloadState {
+    schema: SchemaRef,
+    light_projection: SchemaRef,
+    rows_per_batch: usize,
+    payload_bytes: usize,
+    preload_batches: usize,
+    steady_batches: usize,
+    writer_batches_per_step: usize,
+    pinned_snapshot: DbSnapshot,
+    pinned_manifest_version: DbVersion,
+    seed: u64,
+    next_step: Arc<AtomicU64>,
+    next_append_key: Arc<AtomicU64>,
+    light_scan_limit: usize,
+    heavy_scan_limit: usize,
+    estimated_row_bytes: u64,
+    logical_target_bytes: u64,
+    reader_expectations: Vec<SwmrReaderExpectationArtifact>,
+    manifest_reconstruction_observations: Vec<SwmrReaderObservationArtifact>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SurfaceWorkloadState {
+    light_projection: SchemaRef,
+    light_scan_limit: usize,
+    heavy_scan_limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SwmrPinnedSnapshotMode {
+    HeldSnapshot,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SwmrReaderExpectationArtifact {
+    pub(crate) class: SwmrReaderClass,
+    pub(crate) key_band: SwmrReaderKeyBand,
+    pub(crate) validation_model: SwmrReaderValidationModel,
+    pub(crate) expected_rows_per_scan: usize,
+    pub(crate) expected_first_key: Option<String>,
+    pub(crate) expected_last_key: Option<String>,
+    pub(crate) expected_key_fingerprint: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SwmrReaderObservationArtifact {
+    pub(crate) class: SwmrReaderClass,
+    pub(crate) rows_per_scan: usize,
+    pub(crate) first_key: Option<String>,
+    pub(crate) last_key: Option<String>,
+    pub(crate) key_fingerprint: u64,
+    pub(crate) rows_match_expected: bool,
+    pub(crate) all_keys_in_expected_band: bool,
+    pub(crate) first_key_matches_expected: bool,
+    pub(crate) last_key_matches_expected: bool,
+    pub(crate) fingerprint_matches_expected: bool,
+    pub(crate) valid: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SwmrWorkloadParams {
+    pub(crate) rows_per_batch: usize,
+    pub(crate) payload_bytes: usize,
+    pub(crate) preload_batches: usize,
+    pub(crate) steady_batches: usize,
+    pub(crate) writer_batches_per_step: usize,
+    pub(crate) seed: u64,
+}
+
+impl SurfaceWorkloadState {
+    pub(crate) fn new(light_projection: SchemaRef) -> Self {
+        Self {
+            light_projection,
+            light_scan_limit: DEFAULT_SURFACE_LIGHT_SCAN_LIMIT,
+            heavy_scan_limit: DEFAULT_SURFACE_HEAVY_SCAN_LIMIT,
+        }
+    }
+}
+
+impl SwmrWorkloadState {
+    pub(crate) fn new(
+        schema: SchemaRef,
+        light_projection: SchemaRef,
+        pinned_snapshot: DbSnapshot,
+        pinned_manifest_version: DbVersion,
+        reader_expectations: Vec<SwmrReaderExpectationArtifact>,
+        manifest_reconstruction_observations: Vec<SwmrReaderObservationArtifact>,
+        params: SwmrWorkloadParams,
+    ) -> Self {
+        let estimated_row_bytes = estimate_swmr_row_bytes(params.payload_bytes);
+        let next_append_key = params
+            .preload_batches
+            .checked_mul(params.rows_per_batch)
+            .and_then(|rows| u64::try_from(rows).ok())
+            .unwrap_or(u64::MAX);
+        let total_rows = params
+            .preload_batches
+            .saturating_add(params.steady_batches)
+            .saturating_mul(params.rows_per_batch);
+        Self {
+            schema,
+            light_projection,
+            rows_per_batch: params.rows_per_batch,
+            payload_bytes: params.payload_bytes,
+            preload_batches: params.preload_batches,
+            steady_batches: params.steady_batches,
+            writer_batches_per_step: params.writer_batches_per_step.max(1),
+            pinned_snapshot,
+            pinned_manifest_version,
+            seed: params.seed,
+            next_step: Arc::new(AtomicU64::new(0)),
+            next_append_key: Arc::new(AtomicU64::new(next_append_key)),
+            light_scan_limit: params.rows_per_batch.max(1),
+            heavy_scan_limit: params.rows_per_batch.saturating_mul(8).max(1),
+            estimated_row_bytes,
+            logical_target_bytes: estimated_row_bytes
+                .saturating_mul(u64::try_from(total_rows).unwrap_or(u64::MAX)),
+            reader_expectations,
+            manifest_reconstruction_observations,
+        }
+    }
+
+    pub(crate) fn with_scan_limits(
+        mut self,
+        light_scan_limit: usize,
+        heavy_scan_limit: usize,
+    ) -> Self {
+        self.light_scan_limit = light_scan_limit.max(1);
+        self.heavy_scan_limit = heavy_scan_limit.max(1);
+        self
+    }
+
+    pub(crate) fn with_logical_target_bytes(mut self, logical_target_bytes: u64) -> Self {
+        self.logical_target_bytes = logical_target_bytes;
+        self
+    }
+
+    pub(crate) fn setup_descriptor(&self) -> SwmrSetupDescriptor {
+        let preload_rows = self.preload_batches.saturating_mul(self.rows_per_batch);
+        let steady_rows = self.steady_batches.saturating_mul(self.rows_per_batch);
+        SwmrSetupDescriptor {
+            logical_target_bytes: self.logical_target_bytes,
+            estimated_row_bytes: self.estimated_row_bytes,
+            estimated_preload_logical_bytes: self
+                .estimated_row_bytes
+                .saturating_mul(u64::try_from(preload_rows).unwrap_or(u64::MAX)),
+            estimated_steady_logical_bytes: self
+                .estimated_row_bytes
+                .saturating_mul(u64::try_from(steady_rows).unwrap_or(u64::MAX)),
+            payload_bytes: self.payload_bytes,
+            preload_batches: self.preload_batches,
+            steady_batches: self.steady_batches,
+            writer_batches_per_step: self.writer_batches_per_step,
+            pinned_snapshot_mode: SwmrPinnedSnapshotMode::HeldSnapshot,
+            pinned_snapshot_ts: self.pinned_snapshot.read_timestamp().get(),
+            pinned_manifest_version_ts: self.pinned_manifest_version.timestamp.get(),
+            reader_count: 4,
+            light_scan_limit: self.light_scan_limit,
+            heavy_scan_limit: self.heavy_scan_limit,
+            held_snapshot_expectations: self.reader_expectations.clone(),
+            manifest_reconstruction_observations: self.manifest_reconstruction_observations.clone(),
+        }
+    }
+
+    fn reader_classes(&self) -> [SwmrReaderClass; 4] {
+        [
+            SwmrReaderClass::HeadLight,
+            SwmrReaderClass::HeadHeavy,
+            SwmrReaderClass::PinnedLight,
+            SwmrReaderClass::PinnedHeavy,
+        ]
+    }
+
+    fn expectation_for(&self, class: SwmrReaderClass) -> Option<&SwmrReaderExpectationArtifact> {
+        self.reader_expectations
+            .iter()
+            .find(|expectation| expectation.class == class)
+    }
+
+    fn observation_for(
+        &self,
+        class: SwmrReaderClass,
+        observation: SwmrReaderScanObservation,
+    ) -> Result<SwmrReaderObservationArtifact, BenchError> {
+        let Some(expectation) = self.expectation_for(class) else {
+            return Err(BenchError::Message(format!(
+                "missing swmr expectation for reader `{}`",
+                class.as_str()
+            )));
+        };
+        let rows_match_expected = observation.rows_per_scan == expectation.expected_rows_per_scan;
+        let first_key_matches_expected =
+            observation.first_key.as_ref() == expectation.expected_first_key.as_ref();
+        let last_key_matches_expected =
+            observation.last_key.as_ref() == expectation.expected_last_key.as_ref();
+        let fingerprint_matches_expected =
+            observation.key_fingerprint == expectation.expected_key_fingerprint;
+        let valid = match expectation.validation_model {
+            SwmrReaderValidationModel::ExactShapeStable => {
+                rows_match_expected
+                    && observation.all_keys_in_expected_band
+                    && first_key_matches_expected
+                    && last_key_matches_expected
+                    && fingerprint_matches_expected
+            }
+            SwmrReaderValidationModel::CountAndKeyBand => {
+                rows_match_expected && observation.all_keys_in_expected_band
+            }
+        };
+
+        Ok(SwmrReaderObservationArtifact {
+            class,
+            rows_per_scan: observation.rows_per_scan,
+            first_key: observation.first_key,
+            last_key: observation.last_key,
+            key_fingerprint: observation.key_fingerprint,
+            rows_match_expected,
+            all_keys_in_expected_band: observation.all_keys_in_expected_band,
+            first_key_matches_expected,
+            last_key_matches_expected,
+            fingerprint_matches_expected,
+            valid,
+        })
+    }
+
+    fn validate_reader_observation(
+        &self,
+        class: SwmrReaderClass,
+        observation: &SwmrReaderObservationArtifact,
+    ) -> Result<(), BenchError> {
+        if observation.valid {
+            return Ok(());
+        }
+
+        let Some(expectation) = self.expectation_for(class) else {
+            return Err(BenchError::Message(format!(
+                "missing swmr expectation for reader `{}`",
+                class.as_str()
+            )));
+        };
+
+        Err(BenchError::Message(format!(
+            "swmr reader `{}` violated {:?} validity: rows={} expected_rows={} first_key={:?} \
+             expected_first_key={:?} last_key={:?} expected_last_key={:?} fingerprint={} \
+             expected_fingerprint={} all_keys_in_expected_band={} pinned_snapshot_ts={} \
+             pinned_manifest_version_ts={}",
+            class.as_str(),
+            expectation.validation_model,
+            observation.rows_per_scan,
+            expectation.expected_rows_per_scan,
+            observation.first_key,
+            expectation.expected_first_key,
+            observation.last_key,
+            expectation.expected_last_key,
+            observation.key_fingerprint,
+            expectation.expected_key_fingerprint,
+            observation.all_keys_in_expected_band,
+            self.pinned_snapshot.read_timestamp().get(),
+            self.pinned_manifest_version.timestamp.get()
+        )))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ScenarioState {
     pub(crate) scenario_id: &'static str,
@@ -1211,6 +1587,8 @@ pub(crate) struct ScenarioState {
     pub(crate) volume_ready: StorageVolumeArtifact,
     pub(crate) gc_observation: Option<GcObservationArtifact>,
     pub(crate) write_state: Option<WriteWorkloadState>,
+    pub(crate) swmr_state: Option<SwmrWorkloadState>,
+    pub(crate) surface_state: Option<SurfaceWorkloadState>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1219,8 +1597,106 @@ pub(crate) struct BenchmarkArtifact {
     pub(crate) benchmark_id: &'static str,
     pub(crate) run_id: String,
     pub(crate) generated_at_unix_ms: u64,
+    pub(crate) topology: BenchmarkTopologyArtifact,
     pub(crate) config: ResolvedConfigArtifact,
     pub(crate) scenarios: Vec<ScenarioArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BenchmarkTopologyArtifact {
+    runner_env: Option<String>,
+    runner_region: Option<String>,
+    runner_az: Option<String>,
+    runner_instance_type: Option<String>,
+    bucket_region: Option<String>,
+    bucket_az: Option<String>,
+    object_store_flavor: Option<String>,
+    endpoint_kind: Option<String>,
+    network_path: Option<String>,
+    median_rtt_ms: Option<f64>,
+    same_region: Option<bool>,
+    same_az: Option<bool>,
+}
+
+impl BenchmarkTopologyArtifact {
+    pub(crate) fn from_env() -> Result<Self, BenchError> {
+        let runner_region = env_optional_trimmed("TONBO_BENCH_RUNNER_REGION")?;
+        let runner_az = env_optional_trimmed("TONBO_BENCH_RUNNER_AZ")?;
+        let bucket_region = env_optional_trimmed("TONBO_BENCH_BUCKET_REGION")?;
+        let bucket_az = env_optional_trimmed("TONBO_BENCH_BUCKET_AZ")?;
+        let same_region = match (&runner_region, &bucket_region) {
+            (Some(runner), Some(bucket)) => Some(runner == bucket),
+            _ => None,
+        };
+        let same_az = match (&runner_az, &bucket_az) {
+            (Some(runner), Some(bucket)) => Some(runner == bucket),
+            _ => None,
+        };
+
+        Ok(Self {
+            runner_env: env_optional_trimmed("TONBO_BENCH_RUNNER_ENV")?,
+            runner_region,
+            runner_az,
+            runner_instance_type: env_optional_trimmed("TONBO_BENCH_RUNNER_INSTANCE_TYPE")?,
+            bucket_region,
+            bucket_az,
+            object_store_flavor: env_optional_trimmed("TONBO_BENCH_OBJECT_STORE_FLAVOR")?,
+            endpoint_kind: env_optional_trimmed("TONBO_BENCH_ENDPOINT_KIND")?,
+            network_path: env_optional_trimmed("TONBO_BENCH_NETWORK_PATH")?,
+            median_rtt_ms: env_optional_f64("TONBO_BENCH_MEDIAN_RTT_MS")?,
+            same_region,
+            same_az,
+        })
+    }
+
+    fn has_any_signal(&self) -> bool {
+        self.runner_env.is_some()
+            || self.runner_region.is_some()
+            || self.runner_az.is_some()
+            || self.runner_instance_type.is_some()
+            || self.bucket_region.is_some()
+            || self.bucket_az.is_some()
+            || self.object_store_flavor.is_some()
+            || self.endpoint_kind.is_some()
+            || self.network_path.is_some()
+            || self.median_rtt_ms.is_some()
+            || self.same_region.is_some()
+            || self.same_az.is_some()
+    }
+
+    fn summary_line(&self) -> Option<String> {
+        if !self.has_any_signal() {
+            return None;
+        }
+        let mut fields = Vec::new();
+        push_topology_field(&mut fields, "runner_env", self.runner_env.as_deref());
+        push_topology_field(&mut fields, "runner_region", self.runner_region.as_deref());
+        push_topology_field(&mut fields, "runner_az", self.runner_az.as_deref());
+        push_topology_field(
+            &mut fields,
+            "runner_instance_type",
+            self.runner_instance_type.as_deref(),
+        );
+        push_topology_field(&mut fields, "bucket_region", self.bucket_region.as_deref());
+        push_topology_field(&mut fields, "bucket_az", self.bucket_az.as_deref());
+        push_topology_field(
+            &mut fields,
+            "object_store_flavor",
+            self.object_store_flavor.as_deref(),
+        );
+        push_topology_field(&mut fields, "endpoint_kind", self.endpoint_kind.as_deref());
+        push_topology_field(&mut fields, "network_path", self.network_path.as_deref());
+        if let Some(rtt) = self.median_rtt_ms {
+            fields.push(format!("median_rtt_ms={rtt:.2}"));
+        }
+        if let Some(same_region) = self.same_region {
+            fields.push(format!("same_region={same_region}"));
+        }
+        if let Some(same_az) = self.same_az {
+            fields.push(format!("same_az={same_az}"));
+        }
+        Some(fields.join(", "))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1288,6 +1764,8 @@ struct ScenarioSetupArtifact {
     physical_stale_estimate_ready: PhysicalStaleEstimateArtifact,
     gc_observation: Option<GcObservationArtifact>,
     io: IoCountersArtifact,
+    swmr: Option<SwmrSetupDescriptor>,
+    surface: Option<SurfaceSetupDescriptor>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1303,6 +1781,8 @@ struct ScenarioSummaryArtifact {
     physical_stale_estimate: Option<PhysicalStaleEstimateArtifact>,
     gc: Option<GcDerivedArtifact>,
     io: IoCountersArtifact,
+    swmr: Option<SwmrSummaryArtifact>,
+    surface: Option<SurfaceSummaryArtifact>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1329,6 +1809,8 @@ struct ScenarioMeasurement {
     read_path: Option<ReadPathAggregate>,
     physical_stale_estimate: Option<PhysicalStaleEstimateArtifact>,
     io: IoCountersArtifact,
+    swmr: Option<SwmrAggregate>,
+    surface: Option<SurfaceAggregate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1348,6 +1830,78 @@ struct ReadPathInternalSummary {
     mean_build_scan_streams_ns: f64,
     mean_merge_init_ns: f64,
     mean_package_init_ns: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct WritePathSummary {
+    mean_partition_ns: f64,
+    mean_wal_append_ns: f64,
+    mean_wal_commit_ns: f64,
+    mean_mutable_insert_ns: f64,
+    mean_seal_ns: f64,
+    mean_minor_compaction_ns: f64,
+    mean_total_ns: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct SurfaceSetupDescriptor {
+    light_scan_limit: usize,
+    heavy_scan_limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SurfaceSummaryArtifact {
+    snapshot_latency_ns: LatencySummary,
+    write_latency_ns: LatencySummary,
+    write_to_visible_latency_ns: LatencySummary,
+    write_path_ns: WritePathSummary,
+    latest_light: SurfaceReadSummaryArtifact,
+    latest_heavy: SurfaceReadSummaryArtifact,
+    fresh_light: SurfaceReadSummaryArtifact,
+}
+
+#[derive(Debug, Serialize)]
+struct SurfaceReadSummaryArtifact {
+    rows_processed: u64,
+    mean_rows_per_scan: f64,
+    min_rows_per_scan: usize,
+    max_rows_per_scan: usize,
+    latency_ns: LatencySummary,
+    read_path_latency_ns: ReadPathLatencySummary,
+    read_path_internal_ns: ReadPathInternalSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct SwmrSummaryArtifact {
+    writer_rows_processed: u64,
+    writer_latency_ns: LatencySummary,
+    writer_path_ns: WritePathSummary,
+    readers: Vec<SwmrReaderSummaryArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct SwmrReaderSummaryArtifact {
+    class: SwmrReaderClass,
+    key_band: SwmrReaderKeyBand,
+    validation_model: SwmrReaderValidationModel,
+    expected_rows_per_scan: usize,
+    expected_first_key: Option<String>,
+    expected_last_key: Option<String>,
+    expected_key_fingerprint: u64,
+    rows_processed: u64,
+    mean_rows_per_scan: f64,
+    min_rows_per_scan: usize,
+    max_rows_per_scan: usize,
+    unique_key_fingerprints: usize,
+    all_rows_match_expected: bool,
+    all_keys_in_expected_band: bool,
+    all_first_key_matches_expected: bool,
+    all_last_key_matches_expected: bool,
+    all_fingerprints_match_expected: bool,
+    valid: bool,
+    latency_ns: LatencySummary,
+    read_path_latency_ns: ReadPathLatencySummary,
+    read_path_internal_ns: ReadPathInternalSummary,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1450,10 +2004,366 @@ impl ReadPathAggregate {
     }
 }
 
+#[derive(Default)]
+struct WritePathAggregate {
+    samples: usize,
+    partition_ns_total: u128,
+    wal_append_ns_total: u128,
+    wal_commit_ns_total: u128,
+    mutable_insert_ns_total: u128,
+    seal_ns_total: u128,
+    minor_compaction_ns_total: u128,
+    total_ns_total: u128,
+}
+
+impl WritePathAggregate {
+    fn record(&mut self, profile: WritePathProfile) {
+        self.samples = self.samples.saturating_add(1);
+        self.partition_ns_total = self
+            .partition_ns_total
+            .saturating_add(u128::from(profile.partition_ns()));
+        self.wal_append_ns_total = self
+            .wal_append_ns_total
+            .saturating_add(u128::from(profile.wal_append_ns()));
+        self.wal_commit_ns_total = self
+            .wal_commit_ns_total
+            .saturating_add(u128::from(profile.wal_commit_ns()));
+        self.mutable_insert_ns_total = self
+            .mutable_insert_ns_total
+            .saturating_add(u128::from(profile.mutable_insert_ns()));
+        self.seal_ns_total = self
+            .seal_ns_total
+            .saturating_add(u128::from(profile.seal_ns()));
+        self.minor_compaction_ns_total = self
+            .minor_compaction_ns_total
+            .saturating_add(u128::from(profile.minor_compaction_ns()));
+        self.total_ns_total = self
+            .total_ns_total
+            .saturating_add(u128::from(profile.total_ns()));
+    }
+
+    fn to_summary(&self) -> Option<WritePathSummary> {
+        if self.samples == 0 {
+            return None;
+        }
+        let samples = self.samples as f64;
+        Some(WritePathSummary {
+            mean_partition_ns: self.partition_ns_total as f64 / samples,
+            mean_wal_append_ns: self.wal_append_ns_total as f64 / samples,
+            mean_wal_commit_ns: self.wal_commit_ns_total as f64 / samples,
+            mean_mutable_insert_ns: self.mutable_insert_ns_total as f64 / samples,
+            mean_seal_ns: self.seal_ns_total as f64 / samples,
+            mean_minor_compaction_ns: self.minor_compaction_ns_total as f64 / samples,
+            mean_total_ns: self.total_ns_total as f64 / samples,
+        })
+    }
+}
+
+#[derive(Default)]
+struct SurfaceAggregate {
+    snapshot_latencies_ns: Vec<u64>,
+    write_latencies_ns: Vec<u64>,
+    write_to_visible_latencies_ns: Vec<u64>,
+    write_path: WritePathAggregate,
+    latest_light: SurfaceReadAggregate,
+    latest_heavy: SurfaceReadAggregate,
+    fresh_light: SurfaceReadAggregate,
+}
+
+impl SurfaceAggregate {
+    fn record(&mut self, result: SurfaceOperationResult) {
+        self.snapshot_latencies_ns.push(result.snapshot_latency_ns);
+        self.write_latencies_ns.push(result.write_latency_ns);
+        self.write_to_visible_latencies_ns
+            .push(result.write_to_visible_latency_ns);
+        self.write_path.record(result.write_profile);
+        self.latest_light.record(result.latest_light);
+        self.latest_heavy.record(result.latest_heavy);
+        self.fresh_light.record(result.fresh_light);
+    }
+
+    fn to_summary(&self) -> Option<SurfaceSummaryArtifact> {
+        Some(SurfaceSummaryArtifact {
+            snapshot_latency_ns: latency_summary(&self.snapshot_latencies_ns),
+            write_latency_ns: latency_summary(&self.write_latencies_ns),
+            write_to_visible_latency_ns: latency_summary(&self.write_to_visible_latencies_ns),
+            write_path_ns: self.write_path.to_summary()?,
+            latest_light: self.latest_light.to_summary()?,
+            latest_heavy: self.latest_heavy.to_summary()?,
+            fresh_light: self.fresh_light.to_summary()?,
+        })
+    }
+}
+
+#[derive(Default)]
+struct SurfaceReadAggregate {
+    samples: usize,
+    rows_processed: u64,
+    min_rows_per_scan: usize,
+    max_rows_per_scan: usize,
+    latencies_ns: Vec<u64>,
+    read_path: ReadPathAggregate,
+}
+
+impl SurfaceReadAggregate {
+    fn record(&mut self, result: SurfaceReadOperationResult) {
+        self.samples = self.samples.saturating_add(1);
+        self.rows_processed = self
+            .rows_processed
+            .saturating_add(u64::try_from(result.rows).unwrap_or(u64::MAX));
+        self.min_rows_per_scan = if self.samples == 1 {
+            result.rows
+        } else {
+            self.min_rows_per_scan.min(result.rows)
+        };
+        self.max_rows_per_scan = self.max_rows_per_scan.max(result.rows);
+        self.latencies_ns.push(result.latency_ns);
+        self.read_path.record(result.read_path);
+    }
+
+    fn to_summary(&self) -> Option<SurfaceReadSummaryArtifact> {
+        if self.samples == 0 {
+            return None;
+        }
+        let scans = self.samples as f64;
+        Some(SurfaceReadSummaryArtifact {
+            rows_processed: self.rows_processed,
+            mean_rows_per_scan: self.rows_processed as f64 / scans,
+            min_rows_per_scan: self.min_rows_per_scan,
+            max_rows_per_scan: self.max_rows_per_scan,
+            latency_ns: latency_summary(&self.latencies_ns),
+            read_path_latency_ns: self.read_path.to_summary()?,
+            read_path_internal_ns: self.read_path.to_internal_summary()?,
+        })
+    }
+}
+
+#[derive(Default)]
+struct SwmrAggregate {
+    writer_rows_processed: u64,
+    writer_latencies_ns: Vec<u64>,
+    writer_path: WritePathAggregate,
+    readers: Vec<SwmrReaderAggregate>,
+}
+
+impl SwmrAggregate {
+    fn record(&mut self, result: SwmrOperationResult) {
+        self.writer_rows_processed = self
+            .writer_rows_processed
+            .saturating_add(u64::try_from(result.writer_rows).unwrap_or(u64::MAX));
+        self.writer_latencies_ns.push(result.writer_latency_ns);
+        self.writer_path.record(result.writer_profile);
+        for reader in result.readers {
+            if let Some(existing) = self
+                .readers
+                .iter_mut()
+                .find(|aggregate| aggregate.class == reader.class)
+            {
+                existing.record(reader);
+            } else {
+                let mut aggregate = SwmrReaderAggregate::new(reader.class);
+                aggregate.record(reader);
+                self.readers.push(aggregate);
+            }
+        }
+        self.readers.sort_by_key(|reader| match reader.class {
+            SwmrReaderClass::HeadLight => 0,
+            SwmrReaderClass::HeadHeavy => 1,
+            SwmrReaderClass::PinnedLight => 2,
+            SwmrReaderClass::PinnedHeavy => 3,
+        });
+    }
+
+    fn to_summary(&self, state: &SwmrWorkloadState) -> Option<SwmrSummaryArtifact> {
+        if self.writer_latencies_ns.is_empty() && self.readers.is_empty() {
+            return None;
+        }
+        Some(SwmrSummaryArtifact {
+            writer_rows_processed: self.writer_rows_processed,
+            writer_latency_ns: latency_summary(&self.writer_latencies_ns),
+            writer_path_ns: self.writer_path.to_summary()?,
+            readers: self
+                .readers
+                .iter()
+                .filter_map(|reader| reader.to_summary(state))
+                .collect(),
+        })
+    }
+}
+
+struct SwmrReaderAggregate {
+    class: SwmrReaderClass,
+    samples: usize,
+    rows_processed: u64,
+    min_rows_per_scan: usize,
+    max_rows_per_scan: usize,
+    latencies_ns: Vec<u64>,
+    read_path: ReadPathAggregate,
+    all_rows_match_expected: bool,
+    all_keys_in_expected_band: bool,
+    all_first_key_matches_expected: bool,
+    all_last_key_matches_expected: bool,
+    all_fingerprints_match_expected: bool,
+    valid: bool,
+    key_fingerprints: BTreeSet<u64>,
+}
+
+impl SwmrReaderAggregate {
+    fn new(class: SwmrReaderClass) -> Self {
+        Self {
+            class,
+            samples: 0,
+            rows_processed: 0,
+            min_rows_per_scan: usize::MAX,
+            max_rows_per_scan: 0,
+            latencies_ns: Vec::new(),
+            read_path: ReadPathAggregate::default(),
+            all_rows_match_expected: true,
+            all_keys_in_expected_band: true,
+            all_first_key_matches_expected: true,
+            all_last_key_matches_expected: true,
+            all_fingerprints_match_expected: true,
+            valid: true,
+            key_fingerprints: BTreeSet::new(),
+        }
+    }
+
+    fn record(&mut self, result: SwmrReaderOperationResult) {
+        self.samples = self.samples.saturating_add(1);
+        self.rows_processed = self
+            .rows_processed
+            .saturating_add(u64::try_from(result.rows).unwrap_or(u64::MAX));
+        self.min_rows_per_scan = self.min_rows_per_scan.min(result.rows);
+        self.max_rows_per_scan = self.max_rows_per_scan.max(result.rows);
+        self.latencies_ns.push(result.latency_ns);
+        self.read_path.record(result.read_path);
+        self.all_rows_match_expected &= result.observation.rows_match_expected;
+        self.all_keys_in_expected_band &= result.observation.all_keys_in_expected_band;
+        self.all_first_key_matches_expected &= result.observation.first_key_matches_expected;
+        self.all_last_key_matches_expected &= result.observation.last_key_matches_expected;
+        self.all_fingerprints_match_expected &= result.observation.fingerprint_matches_expected;
+        self.valid &= result.observation.valid;
+        let _ = self
+            .key_fingerprints
+            .insert(result.observation.key_fingerprint);
+    }
+
+    fn to_summary(&self, state: &SwmrWorkloadState) -> Option<SwmrReaderSummaryArtifact> {
+        let expectation = state.expectation_for(self.class)?;
+        let scans = self.samples.max(1) as f64;
+        let mean_rows_per_scan = self.rows_processed as f64 / scans;
+        Some(SwmrReaderSummaryArtifact {
+            class: self.class,
+            key_band: expectation.key_band,
+            validation_model: expectation.validation_model,
+            expected_rows_per_scan: expectation.expected_rows_per_scan,
+            expected_first_key: expectation.expected_first_key.clone(),
+            expected_last_key: expectation.expected_last_key.clone(),
+            expected_key_fingerprint: expectation.expected_key_fingerprint,
+            rows_processed: self.rows_processed,
+            mean_rows_per_scan,
+            min_rows_per_scan: if self.samples == 0 {
+                0
+            } else {
+                self.min_rows_per_scan
+            },
+            max_rows_per_scan: self.max_rows_per_scan,
+            unique_key_fingerprints: self.key_fingerprints.len(),
+            all_rows_match_expected: self.all_rows_match_expected,
+            all_keys_in_expected_band: self.all_keys_in_expected_band,
+            all_first_key_matches_expected: self.all_first_key_matches_expected,
+            all_last_key_matches_expected: self.all_last_key_matches_expected,
+            all_fingerprints_match_expected: self.all_fingerprints_match_expected,
+            valid: self.valid,
+            latency_ns: latency_summary(&self.latencies_ns),
+            read_path_latency_ns: self.read_path.to_summary()?,
+            read_path_internal_ns: self.read_path.to_internal_summary()?,
+        })
+    }
+}
+
 struct OperationResult {
     rows: usize,
     read_path: Option<ReadPathBreakdown>,
+    swmr: Option<SwmrOperationResult>,
+    surface: Option<SurfaceOperationResult>,
     physical_stale_estimate: Option<PhysicalStaleEstimateArtifact>,
+}
+
+struct SwmrOperationResult {
+    writer_rows: usize,
+    writer_latency_ns: u64,
+    writer_profile: WritePathProfile,
+    readers: Vec<SwmrReaderOperationResult>,
+}
+
+struct SwmrReaderOperationResult {
+    class: SwmrReaderClass,
+    rows: usize,
+    observation: SwmrReaderObservationArtifact,
+    latency_ns: u64,
+    read_path: ReadPathBreakdown,
+}
+
+struct SurfaceOperationResult {
+    snapshot_latency_ns: u64,
+    latest_light: SurfaceReadOperationResult,
+    latest_heavy: SurfaceReadOperationResult,
+    write_latency_ns: u64,
+    write_to_visible_latency_ns: u64,
+    write_profile: WritePathProfile,
+    fresh_light: SurfaceReadOperationResult,
+}
+
+struct SurfaceReadOperationResult {
+    rows: usize,
+    latency_ns: u64,
+    read_path: ReadPathBreakdown,
+}
+
+pub(crate) struct SwmrReaderScanObservation {
+    key_band: SwmrReaderKeyBand,
+    pub(crate) rows_per_scan: usize,
+    pub(crate) first_key: Option<String>,
+    pub(crate) last_key: Option<String>,
+    pub(crate) key_fingerprint: u64,
+    pub(crate) all_keys_in_expected_band: bool,
+}
+
+impl SwmrReaderScanObservation {
+    fn new(key_band: SwmrReaderKeyBand) -> Self {
+        Self {
+            key_band,
+            rows_per_scan: 0,
+            first_key: None,
+            last_key: None,
+            key_fingerprint: swmr_fingerprint_seed(key_band),
+            all_keys_in_expected_band: true,
+        }
+    }
+
+    fn observe_batch(&mut self, batch: &RecordBatch) -> Result<(), BenchError> {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                BenchError::Message(
+                    "swmr reader expected Utf8 id column at projection index 0".to_string(),
+                )
+            })?;
+        for row_idx in 0..batch.num_rows() {
+            let key = ids.value(row_idx);
+            self.all_keys_in_expected_band &= self.key_band.contains_key(key);
+            if self.first_key.is_none() {
+                self.first_key = Some(key.to_string());
+            }
+            self.last_key = Some(key.to_string());
+            self.key_fingerprint = swmr_fingerprint_update(self.key_fingerprint, key.as_bytes());
+            self.rows_per_scan = self.rows_per_scan.saturating_add(1);
+        }
+        Ok(())
+    }
 }
 
 impl ScenarioDimensionsArtifact {
@@ -1495,6 +2405,8 @@ async fn run_scenario_operation(scenario: &ScenarioState) -> Result<OperationRes
             Ok(OperationResult {
                 rows,
                 read_path: Some(read_path),
+                swmr: None,
+                surface: None,
                 physical_stale_estimate: None,
             })
         }
@@ -1513,6 +2425,8 @@ async fn run_scenario_operation(scenario: &ScenarioState) -> Result<OperationRes
             Ok(OperationResult {
                 rows,
                 read_path: Some(read_path),
+                swmr: None,
+                surface: None,
                 physical_stale_estimate: None,
             })
         }
@@ -1527,6 +2441,56 @@ async fn run_scenario_operation(scenario: &ScenarioState) -> Result<OperationRes
             Ok(OperationResult {
                 rows,
                 read_path: None,
+                swmr: None,
+                surface: None,
+                physical_stale_estimate: None,
+            })
+        }
+        ScenarioWorkload::SwmrMixed => {
+            let swmr_state = scenario.swmr_state.as_ref().ok_or_else(|| {
+                BenchError::Message(format!(
+                    "scenario `{}` missing swmr workload state",
+                    scenario.benchmark_id
+                ))
+            })?;
+            let result = run_swmr_mixed_operation(&scenario.db, swmr_state).await?;
+            let reader_rows = result
+                .readers
+                .iter()
+                .fold(0usize, |acc, reader| acc.saturating_add(reader.rows));
+            let rows = result.writer_rows.saturating_add(reader_rows);
+            Ok(OperationResult {
+                rows,
+                read_path: None,
+                swmr: Some(result),
+                surface: None,
+                physical_stale_estimate: None,
+            })
+        }
+        ScenarioWorkload::Surface => {
+            let surface_state = scenario.surface_state.as_ref().ok_or_else(|| {
+                BenchError::Message(format!(
+                    "scenario `{}` missing surface workload state",
+                    scenario.benchmark_id
+                ))
+            })?;
+            let write_state = scenario.write_state.as_ref().ok_or_else(|| {
+                BenchError::Message(format!(
+                    "scenario `{}` missing write workload state",
+                    scenario.benchmark_id
+                ))
+            })?;
+            let result = run_surface_operation(&scenario.db, surface_state, write_state).await?;
+            let rows = result
+                .latest_light
+                .rows
+                .saturating_add(result.latest_heavy.rows)
+                .saturating_add(result.fresh_light.rows);
+            Ok(OperationResult {
+                rows,
+                read_path: None,
+                swmr: None,
+                surface: Some(result),
                 physical_stale_estimate: None,
             })
         }
@@ -1538,6 +2502,8 @@ async fn run_scenario_operation(scenario: &ScenarioState) -> Result<OperationRes
             Ok(OperationResult {
                 rows: 1,
                 read_path: None,
+                swmr: None,
+                surface: None,
                 physical_stale_estimate: Some(estimate),
             })
         }
@@ -1578,6 +2544,769 @@ async fn ingest_next_write_batch(
     Err(BenchError::Message(
         "ingest retry loop exited unexpectedly".to_string(),
     ))
+}
+
+async fn ingest_next_write_batch_profiled_local(
+    db: &DB<ProbedFs<LocalFs>, TokioExecutor>,
+    write_state: &WriteWorkloadState,
+) -> Result<WritePathProfile, BenchError> {
+    let batch_idx_u64 = write_state.next_batch.fetch_add(1, Ordering::Relaxed);
+    let batch_idx = usize::try_from(batch_idx_u64).unwrap_or(usize::MAX);
+    for attempt in 1..=INGEST_RETRY_MAX_ATTEMPTS {
+        let batch = build_batch(
+            &write_state.schema,
+            write_state.rows_per_batch,
+            write_state.key_space,
+            write_state.seed,
+            batch_idx,
+        )?;
+        let tombstones = vec![false; batch.num_rows()];
+        let ingest_result = db
+            .ingest_with_tombstones_with_profile(batch, tombstones)
+            .await;
+        match ingest_result {
+            Ok(profile) => return Ok(profile),
+            Err(err) => {
+                if !is_retryable_ingest_error(&err) || attempt == INGEST_RETRY_MAX_ATTEMPTS {
+                    return Err(BenchError::Db(err));
+                }
+                let delay_ms = (attempt as u64).saturating_mul(INGEST_RETRY_BACKOFF_BASE_MS);
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+    Err(BenchError::Message(
+        "profiled ingest retry loop exited unexpectedly".to_string(),
+    ))
+}
+
+async fn ingest_next_write_batch_profiled_object_store(
+    db: &DB<ProbedFs<AmazonS3>, TokioExecutor>,
+    write_state: &WriteWorkloadState,
+) -> Result<WritePathProfile, BenchError> {
+    let batch_idx_u64 = write_state.next_batch.fetch_add(1, Ordering::Relaxed);
+    let batch_idx = usize::try_from(batch_idx_u64).unwrap_or(usize::MAX);
+    for attempt in 1..=INGEST_RETRY_MAX_ATTEMPTS {
+        let batch = build_batch(
+            &write_state.schema,
+            write_state.rows_per_batch,
+            write_state.key_space,
+            write_state.seed,
+            batch_idx,
+        )?;
+        let tombstones = vec![false; batch.num_rows()];
+        let ingest_result = db
+            .ingest_with_tombstones_with_profile(batch, tombstones)
+            .await;
+        match ingest_result {
+            Ok(profile) => return Ok(profile),
+            Err(err) => {
+                if !is_retryable_ingest_error(&err) || attempt == INGEST_RETRY_MAX_ATTEMPTS {
+                    return Err(BenchError::Db(err));
+                }
+                let delay_ms = (attempt as u64).saturating_mul(INGEST_RETRY_BACKOFF_BASE_MS);
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+    Err(BenchError::Message(
+        "profiled ingest retry loop exited unexpectedly".to_string(),
+    ))
+}
+
+async fn run_swmr_mixed_operation(
+    db: &BenchmarkDb,
+    state: &SwmrWorkloadState,
+) -> Result<SwmrOperationResult, BenchError> {
+    let step_idx = state.next_step.fetch_add(1, Ordering::Relaxed);
+    let writer_started = Instant::now();
+    let mut writer_rows = 0usize;
+    let mut writer_profile = WritePathProfile::default();
+    for batch_offset in 0..state.writer_batches_per_step {
+        let batch_idx = step_idx
+            .saturating_mul(u64::try_from(state.writer_batches_per_step).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(batch_offset).unwrap_or(u64::MAX));
+        let batch = build_swmr_mixed_batch(state, batch_idx)?;
+        let ingest_profile = match db {
+            BenchmarkDb::Local(inner) => {
+                inner
+                    .ingest_with_tombstones_with_profile(batch.0, batch.1)
+                    .await
+            }
+            BenchmarkDb::ObjectStore(inner) => {
+                inner
+                    .ingest_with_tombstones_with_profile(batch.0, batch.1)
+                    .await
+            }
+        }?;
+        writer_profile = accumulate_write_profile(writer_profile, ingest_profile);
+        writer_rows = writer_rows.saturating_add(state.rows_per_batch);
+    }
+    let writer_latency_ns = duration_ns_u64(writer_started.elapsed());
+
+    let mut readers = Vec::with_capacity(4);
+    for class in state.reader_classes() {
+        readers.push(run_swmr_reader(db, state, class).await?);
+    }
+
+    Ok(SwmrOperationResult {
+        writer_rows,
+        writer_latency_ns,
+        writer_profile,
+        readers,
+    })
+}
+
+fn accumulate_write_profile(
+    aggregate: WritePathProfile,
+    sample: WritePathProfile,
+) -> WritePathProfile {
+    aggregate.saturating_add(sample)
+}
+
+async fn run_surface_operation(
+    db: &BenchmarkDb,
+    state: &SurfaceWorkloadState,
+    write_state: &WriteWorkloadState,
+) -> Result<SurfaceOperationResult, BenchError> {
+    match db {
+        BenchmarkDb::Local(inner) => run_surface_operation_local(inner, state, write_state).await,
+        BenchmarkDb::ObjectStore(inner) => {
+            run_surface_operation_object_store(inner, state, write_state).await
+        }
+    }
+}
+
+async fn run_surface_operation_local(
+    db: &DB<ProbedFs<LocalFs>, TokioExecutor>,
+    state: &SurfaceWorkloadState,
+    write_state: &WriteWorkloadState,
+) -> Result<SurfaceOperationResult, BenchError> {
+    let snapshot_started = Instant::now();
+    let _snapshot = db
+        .begin_snapshot()
+        .await
+        .map_err(|err| BenchError::Message(format!("begin_snapshot failed: {err}")))?;
+    let snapshot_latency_ns = duration_ns_u64(snapshot_started.elapsed());
+    let latest_light = execute_surface_light_scan_local(db, state).await?;
+    let latest_heavy = execute_surface_heavy_scan_local(db, state).await?;
+    let write_started = Instant::now();
+    let write_profile = ingest_next_write_batch_profiled_local(db, write_state).await?;
+    let write_latency_ns = duration_ns_u64(write_started.elapsed());
+    let fresh_light = execute_surface_light_scan_local(db, state).await?;
+    Ok(SurfaceOperationResult {
+        snapshot_latency_ns,
+        latest_light,
+        latest_heavy,
+        write_latency_ns,
+        write_to_visible_latency_ns: duration_ns_u64(write_started.elapsed()),
+        write_profile,
+        fresh_light,
+    })
+}
+
+async fn run_surface_operation_object_store(
+    db: &DB<ProbedFs<AmazonS3>, TokioExecutor>,
+    state: &SurfaceWorkloadState,
+    write_state: &WriteWorkloadState,
+) -> Result<SurfaceOperationResult, BenchError> {
+    let snapshot_started = Instant::now();
+    let _snapshot = db
+        .begin_snapshot()
+        .await
+        .map_err(|err| BenchError::Message(format!("begin_snapshot failed: {err}")))?;
+    let snapshot_latency_ns = duration_ns_u64(snapshot_started.elapsed());
+    let latest_light = execute_surface_light_scan_object_store(db, state).await?;
+    let latest_heavy = execute_surface_heavy_scan_object_store(db, state).await?;
+    let write_started = Instant::now();
+    let write_profile = ingest_next_write_batch_profiled_object_store(db, write_state).await?;
+    let write_latency_ns = duration_ns_u64(write_started.elapsed());
+    let fresh_light = execute_surface_light_scan_object_store(db, state).await?;
+    Ok(SurfaceOperationResult {
+        snapshot_latency_ns,
+        latest_light,
+        latest_heavy,
+        write_latency_ns,
+        write_to_visible_latency_ns: duration_ns_u64(write_started.elapsed()),
+        write_profile,
+        fresh_light,
+    })
+}
+
+async fn run_swmr_reader(
+    db: &BenchmarkDb,
+    state: &SwmrWorkloadState,
+    class: SwmrReaderClass,
+) -> Result<SwmrReaderOperationResult, BenchError> {
+    match db {
+        BenchmarkDb::Local(inner) => run_swmr_reader_local(inner, state, class).await,
+        BenchmarkDb::ObjectStore(inner) => run_swmr_reader_object_store(inner, state, class).await,
+    }
+}
+
+async fn run_swmr_reader_local(
+    db: &DB<ProbedFs<LocalFs>, TokioExecutor>,
+    state: &SwmrWorkloadState,
+    class: SwmrReaderClass,
+) -> Result<SwmrReaderOperationResult, BenchError> {
+    let started = Instant::now();
+    let predicate = swmr_predicate(class);
+    let key_band = class.key_band();
+    let projection = if class.is_light() {
+        Some(Arc::clone(&state.light_projection))
+    } else {
+        None
+    };
+    let limit = if class.is_light() {
+        state.light_scan_limit
+    } else {
+        state.heavy_scan_limit
+    };
+    let (observation, read_path) = if class.is_pinned() {
+        let plan_started = Instant::now();
+        let (mut stream, profile) = {
+            let mut builder = state
+                .pinned_snapshot
+                .scan(db)
+                .filter(predicate)
+                .limit(limit);
+            if let Some(projection) = projection {
+                builder = builder.projection(projection);
+            }
+            builder.stream_with_profile().await
+        }
+        .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+        let prepare_ns = duration_ns_u64(plan_started.elapsed());
+        let consume_started = Instant::now();
+        let mut observation = SwmrReaderScanObservation::new(class.key_band());
+        let mut batch_count = 0usize;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result
+                .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+            observation.observe_batch(&batch)?;
+            batch_count = batch_count.saturating_add(1);
+        }
+        (
+            observation,
+            ReadPathBreakdown {
+                prepare_ns,
+                consume_ns: duration_ns_u64(consume_started.elapsed()),
+                batch_count,
+                internal: internal_breakdown(profile),
+            },
+        )
+    } else {
+        execute_scan_profiled_local(db, predicate, projection, limit, key_band).await?
+    };
+    let artifact = state.observation_for(class, observation)?;
+    state.validate_reader_observation(class, &artifact)?;
+    Ok(SwmrReaderOperationResult {
+        class,
+        rows: artifact.rows_per_scan,
+        observation: artifact,
+        latency_ns: duration_ns_u64(started.elapsed()),
+        read_path,
+    })
+}
+
+async fn run_swmr_reader_object_store(
+    db: &DB<ProbedFs<AmazonS3>, TokioExecutor>,
+    state: &SwmrWorkloadState,
+    class: SwmrReaderClass,
+) -> Result<SwmrReaderOperationResult, BenchError> {
+    let started = Instant::now();
+    let predicate = swmr_predicate(class);
+    let key_band = class.key_band();
+    let projection = if class.is_light() {
+        Some(Arc::clone(&state.light_projection))
+    } else {
+        None
+    };
+    let limit = if class.is_light() {
+        state.light_scan_limit
+    } else {
+        state.heavy_scan_limit
+    };
+    let (observation, read_path) = if class.is_pinned() {
+        let plan_started = Instant::now();
+        let (mut stream, profile) = {
+            let mut builder = state
+                .pinned_snapshot
+                .scan(db)
+                .filter(predicate)
+                .limit(limit);
+            if let Some(projection) = projection {
+                builder = builder.projection(projection);
+            }
+            builder.stream_with_profile().await
+        }
+        .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+        let prepare_ns = duration_ns_u64(plan_started.elapsed());
+        let consume_started = Instant::now();
+        let mut observation = SwmrReaderScanObservation::new(class.key_band());
+        let mut batch_count = 0usize;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result
+                .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+            observation.observe_batch(&batch)?;
+            batch_count = batch_count.saturating_add(1);
+        }
+        (
+            observation,
+            ReadPathBreakdown {
+                prepare_ns,
+                consume_ns: duration_ns_u64(consume_started.elapsed()),
+                batch_count,
+                internal: internal_breakdown(profile),
+            },
+        )
+    } else {
+        execute_scan_profiled_object_store(db, predicate, projection, limit, key_band).await?
+    };
+    let artifact = state.observation_for(class, observation)?;
+    state.validate_reader_observation(class, &artifact)?;
+    Ok(SwmrReaderOperationResult {
+        class,
+        rows: artifact.rows_per_scan,
+        observation: artifact,
+        latency_ns: duration_ns_u64(started.elapsed()),
+        read_path,
+    })
+}
+
+async fn execute_scan_profiled_local(
+    db: &DB<ProbedFs<LocalFs>, TokioExecutor>,
+    predicate: Expr,
+    projection: Option<SchemaRef>,
+    limit: usize,
+    key_band: SwmrReaderKeyBand,
+) -> Result<(SwmrReaderScanObservation, ReadPathBreakdown), BenchError> {
+    let plan_started = Instant::now();
+    let (mut stream, profile) = {
+        let mut builder = db.scan().filter(predicate).limit(limit);
+        if let Some(projection) = projection {
+            builder = builder.projection(projection);
+        }
+        builder.stream_with_profile().await
+    }
+    .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+    let prepare_ns = duration_ns_u64(plan_started.elapsed());
+    let consume_started = Instant::now();
+    let mut observation = SwmrReaderScanObservation::new(key_band);
+    let mut batch_count = 0usize;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result
+            .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+        observation.observe_batch(&batch)?;
+        batch_count = batch_count.saturating_add(1);
+    }
+    Ok((
+        observation,
+        ReadPathBreakdown {
+            prepare_ns,
+            consume_ns: duration_ns_u64(consume_started.elapsed()),
+            batch_count,
+            internal: internal_breakdown(profile),
+        },
+    ))
+}
+
+async fn execute_scan_profiled_object_store(
+    db: &DB<ProbedFs<AmazonS3>, TokioExecutor>,
+    predicate: Expr,
+    projection: Option<SchemaRef>,
+    limit: usize,
+    key_band: SwmrReaderKeyBand,
+) -> Result<(SwmrReaderScanObservation, ReadPathBreakdown), BenchError> {
+    let plan_started = Instant::now();
+    let (mut stream, profile) = {
+        let mut builder = db.scan().filter(predicate).limit(limit);
+        if let Some(projection) = projection {
+            builder = builder.projection(projection);
+        }
+        builder.stream_with_profile().await
+    }
+    .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+    let prepare_ns = duration_ns_u64(plan_started.elapsed());
+    let consume_started = Instant::now();
+    let mut observation = SwmrReaderScanObservation::new(key_band);
+    let mut batch_count = 0usize;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result
+            .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+        observation.observe_batch(&batch)?;
+        batch_count = batch_count.saturating_add(1);
+    }
+    Ok((
+        observation,
+        ReadPathBreakdown {
+            prepare_ns,
+            consume_ns: duration_ns_u64(consume_started.elapsed()),
+            batch_count,
+            internal: internal_breakdown(profile),
+        },
+    ))
+}
+
+fn swmr_predicate(class: SwmrReaderClass) -> Expr {
+    match class {
+        SwmrReaderClass::HeadLight | SwmrReaderClass::PinnedLight => Expr::and(vec![
+            Expr::gt_eq("id", ScalarValue::from("hot-00000000")),
+            Expr::lt("id", ScalarValue::from("hot-99999999")),
+        ]),
+        SwmrReaderClass::HeadHeavy | SwmrReaderClass::PinnedHeavy => Expr::and(vec![
+            Expr::gt_eq("id", ScalarValue::from("warm-00000000")),
+            Expr::lt("id", ScalarValue::from("zzzzzzzz")),
+        ]),
+    }
+}
+
+pub(crate) fn surface_light_projection_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]))
+}
+
+fn surface_light_predicate() -> Expr {
+    Expr::and(vec![
+        Expr::gt_eq("id", ScalarValue::from("k00000000")),
+        Expr::lt("id", ScalarValue::from("k00000512")),
+    ])
+}
+
+fn surface_heavy_predicate() -> Expr {
+    Expr::and(vec![
+        Expr::gt_eq("id", ScalarValue::from("k00000000")),
+        Expr::lt("id", ScalarValue::from("k99999999")),
+    ])
+}
+
+async fn execute_surface_light_scan_local(
+    db: &DB<ProbedFs<LocalFs>, TokioExecutor>,
+    state: &SurfaceWorkloadState,
+) -> Result<SurfaceReadOperationResult, BenchError> {
+    let started = Instant::now();
+    let (rows, read_path) = execute_row_count_scan_profiled_local(
+        db,
+        surface_light_predicate(),
+        Some(Arc::clone(&state.light_projection)),
+        state.light_scan_limit,
+    )
+    .await?;
+    Ok(SurfaceReadOperationResult {
+        rows,
+        latency_ns: duration_ns_u64(started.elapsed()),
+        read_path,
+    })
+}
+
+async fn execute_surface_light_scan_object_store(
+    db: &DB<ProbedFs<AmazonS3>, TokioExecutor>,
+    state: &SurfaceWorkloadState,
+) -> Result<SurfaceReadOperationResult, BenchError> {
+    let started = Instant::now();
+    let (rows, read_path) = execute_row_count_scan_profiled_object_store(
+        db,
+        surface_light_predicate(),
+        Some(Arc::clone(&state.light_projection)),
+        state.light_scan_limit,
+    )
+    .await?;
+    Ok(SurfaceReadOperationResult {
+        rows,
+        latency_ns: duration_ns_u64(started.elapsed()),
+        read_path,
+    })
+}
+
+async fn execute_surface_heavy_scan_local(
+    db: &DB<ProbedFs<LocalFs>, TokioExecutor>,
+    state: &SurfaceWorkloadState,
+) -> Result<SurfaceReadOperationResult, BenchError> {
+    let started = Instant::now();
+    let (rows, read_path) = execute_row_count_scan_profiled_local(
+        db,
+        surface_heavy_predicate(),
+        None,
+        state.heavy_scan_limit,
+    )
+    .await?;
+    Ok(SurfaceReadOperationResult {
+        rows,
+        latency_ns: duration_ns_u64(started.elapsed()),
+        read_path,
+    })
+}
+
+async fn execute_surface_heavy_scan_object_store(
+    db: &DB<ProbedFs<AmazonS3>, TokioExecutor>,
+    state: &SurfaceWorkloadState,
+) -> Result<SurfaceReadOperationResult, BenchError> {
+    let started = Instant::now();
+    let (rows, read_path) = execute_row_count_scan_profiled_object_store(
+        db,
+        surface_heavy_predicate(),
+        None,
+        state.heavy_scan_limit,
+    )
+    .await?;
+    Ok(SurfaceReadOperationResult {
+        rows,
+        latency_ns: duration_ns_u64(started.elapsed()),
+        read_path,
+    })
+}
+
+async fn execute_row_count_scan_profiled_local(
+    db: &DB<ProbedFs<LocalFs>, TokioExecutor>,
+    predicate: Expr,
+    projection: Option<SchemaRef>,
+    limit: usize,
+) -> Result<(usize, ReadPathBreakdown), BenchError> {
+    let plan_started = Instant::now();
+    let (mut stream, profile) = {
+        let mut builder = db.scan().filter(predicate).limit(limit);
+        if let Some(projection) = projection {
+            builder = builder.projection(projection);
+        }
+        builder.stream_with_profile().await
+    }
+    .map_err(|err| BenchError::Message(format!("surface scan stream failed: {err}")))?;
+    let prepare_ns = duration_ns_u64(plan_started.elapsed());
+    let consume_started = Instant::now();
+    let mut rows = 0usize;
+    let mut batch_count = 0usize;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result
+            .map_err(|err| BenchError::Message(format!("surface scan stream failed: {err}")))?;
+        rows = rows.saturating_add(batch.num_rows());
+        batch_count = batch_count.saturating_add(1);
+    }
+    Ok((
+        rows,
+        ReadPathBreakdown {
+            prepare_ns,
+            consume_ns: duration_ns_u64(consume_started.elapsed()),
+            batch_count,
+            internal: internal_breakdown(profile),
+        },
+    ))
+}
+
+async fn execute_row_count_scan_profiled_object_store(
+    db: &DB<ProbedFs<AmazonS3>, TokioExecutor>,
+    predicate: Expr,
+    projection: Option<SchemaRef>,
+    limit: usize,
+) -> Result<(usize, ReadPathBreakdown), BenchError> {
+    let plan_started = Instant::now();
+    let (mut stream, profile) = {
+        let mut builder = db.scan().filter(predicate).limit(limit);
+        if let Some(projection) = projection {
+            builder = builder.projection(projection);
+        }
+        builder.stream_with_profile().await
+    }
+    .map_err(|err| BenchError::Message(format!("surface scan stream failed: {err}")))?;
+    let prepare_ns = duration_ns_u64(plan_started.elapsed());
+    let consume_started = Instant::now();
+    let mut rows = 0usize;
+    let mut batch_count = 0usize;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result
+            .map_err(|err| BenchError::Message(format!("surface scan stream failed: {err}")))?;
+        rows = rows.saturating_add(batch.num_rows());
+        batch_count = batch_count.saturating_add(1);
+    }
+    Ok((
+        rows,
+        ReadPathBreakdown {
+            prepare_ns,
+            consume_ns: duration_ns_u64(consume_started.elapsed()),
+            batch_count,
+            internal: internal_breakdown(profile),
+        },
+    ))
+}
+
+pub(crate) async fn swmr_reader_observation_for_snapshot(
+    db: &BenchmarkDb,
+    snapshot: &DbSnapshot,
+    class: SwmrReaderClass,
+    light_projection: &SchemaRef,
+    light_scan_limit: usize,
+    heavy_scan_limit: usize,
+) -> Result<SwmrReaderScanObservation, BenchError> {
+    let predicate = swmr_predicate(class);
+    let key_band = class.key_band();
+    let projection = if class.is_light() {
+        Some(Arc::clone(light_projection))
+    } else {
+        None
+    };
+    let limit = if class.is_light() {
+        light_scan_limit
+    } else {
+        heavy_scan_limit
+    };
+
+    match db {
+        BenchmarkDb::Local(inner) => {
+            execute_snapshot_scan_row_count_local(
+                inner, snapshot, predicate, projection, limit, key_band,
+            )
+            .await
+        }
+        BenchmarkDb::ObjectStore(inner) => {
+            execute_snapshot_scan_row_count_object_store(
+                inner, snapshot, predicate, projection, limit, key_band,
+            )
+            .await
+        }
+    }
+}
+
+async fn execute_snapshot_scan_row_count_local(
+    db: &DB<ProbedFs<LocalFs>, TokioExecutor>,
+    snapshot: &DbSnapshot,
+    predicate: Expr,
+    projection: Option<SchemaRef>,
+    limit: usize,
+    key_band: SwmrReaderKeyBand,
+) -> Result<SwmrReaderScanObservation, BenchError> {
+    let mut stream = {
+        let mut builder = snapshot.scan(db).filter(predicate).limit(limit);
+        if let Some(projection) = projection {
+            builder = builder.projection(projection);
+        }
+        builder.stream().await
+    }
+    .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+    let mut observation = SwmrReaderScanObservation::new(key_band);
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result
+            .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+        observation.observe_batch(&batch)?;
+    }
+    Ok(observation)
+}
+
+async fn execute_snapshot_scan_row_count_object_store(
+    db: &DB<ProbedFs<AmazonS3>, TokioExecutor>,
+    snapshot: &DbSnapshot,
+    predicate: Expr,
+    projection: Option<SchemaRef>,
+    limit: usize,
+    key_band: SwmrReaderKeyBand,
+) -> Result<SwmrReaderScanObservation, BenchError> {
+    let mut stream = {
+        let mut builder = snapshot.scan(db).filter(predicate).limit(limit);
+        if let Some(projection) = projection {
+            builder = builder.projection(projection);
+        }
+        builder.stream().await
+    }
+    .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+    let mut observation = SwmrReaderScanObservation::new(key_band);
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result
+            .map_err(|err| BenchError::Message(format!("swmr scan stream failed: {err}")))?;
+        observation.observe_batch(&batch)?;
+    }
+    Ok(observation)
+}
+
+fn build_swmr_mixed_batch(
+    state: &SwmrWorkloadState,
+    batch_idx: u64,
+) -> Result<(RecordBatch, Vec<bool>), BenchError> {
+    let mut ids = Vec::with_capacity(state.rows_per_batch);
+    let mut values = Vec::with_capacity(state.rows_per_batch);
+    let mut payloads = Vec::with_capacity(state.rows_per_batch);
+    let mut tombstones = Vec::with_capacity(state.rows_per_batch);
+
+    for row_idx in 0..state.rows_per_batch {
+        let ordinal = batch_idx
+            .saturating_mul(u64::try_from(state.rows_per_batch).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(row_idx).unwrap_or(u64::MAX));
+        let selector = deterministic_mix_u64(ordinal, state.seed) % 100;
+        let (id, tombstone) = if selector < SWMR_APPEND_SHARE_PCT {
+            let key = state.next_append_key.fetch_add(1, Ordering::Relaxed);
+            (format!("append-{key:08}"), false)
+        } else if selector < SWMR_APPEND_SHARE_PCT + SWMR_OVERWRITE_SHARE_PCT {
+            (swmr_existing_key(ordinal, state.seed, true), false)
+        } else {
+            (swmr_existing_key(ordinal, state.seed, false), true)
+        };
+        ids.push(id);
+        values.push(
+            i64::try_from(deterministic_mix_u64(ordinal ^ 0x51_4D_57_52, state.seed))
+                .unwrap_or(i64::MAX),
+        );
+        payloads.push(swmr_payload(state.payload_bytes, ordinal));
+        tombstones.push(tombstone);
+    }
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&state.schema),
+        vec![
+            Arc::new(StringArray::from(ids)) as _,
+            Arc::new(Int64Array::from(values)) as _,
+            Arc::new(StringArray::from(payloads)) as _,
+        ],
+    )?;
+    Ok((batch, tombstones))
+}
+
+fn swmr_existing_key(ordinal: u64, seed: u64, allow_warm: bool) -> String {
+    let mixed = deterministic_mix_u64(ordinal ^ 0xC0_11_4D, seed);
+    let hot_slot = mixed % 16_384;
+    if allow_warm && mixed % 10 >= 7 {
+        let warm_slot = mixed % 32_768;
+        format!("warm-{warm_slot:08}")
+    } else {
+        format!("hot-{hot_slot:08}")
+    }
+}
+
+fn swmr_payload(payload_bytes: usize, ordinal: u64) -> String {
+    if payload_bytes == 0 {
+        return String::new();
+    }
+    let prefix = format!("{ordinal:016x}");
+    if payload_bytes <= prefix.len() {
+        return prefix[..payload_bytes].to_string();
+    }
+    let mut payload = String::with_capacity(payload_bytes);
+    payload.push_str(&prefix);
+    while payload.len() < payload_bytes {
+        payload.push('p');
+    }
+    payload.truncate(payload_bytes);
+    payload
+}
+
+fn swmr_fingerprint_seed(key_band: SwmrReaderKeyBand) -> u64 {
+    swmr_fingerprint_update(SWMR_FINGERPRINT_OFFSET_BASIS, key_band.prefix().as_bytes())
+}
+
+fn swmr_fingerprint_update(mut fingerprint: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        fingerprint ^= u64::from(byte);
+        fingerprint = fingerprint.wrapping_mul(SWMR_FINGERPRINT_PRIME);
+    }
+    fingerprint = fingerprint.wrapping_mul(SWMR_FINGERPRINT_PRIME);
+    fingerprint
+}
+
+fn estimate_swmr_row_bytes(payload_bytes: usize) -> u64 {
+    let fixed = 32u64;
+    fixed.saturating_add(u64::try_from(payload_bytes).unwrap_or(u64::MAX))
+}
+
+fn deterministic_mix_u64(ordinal: u64, seed: u64) -> u64 {
+    ordinal
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(seed.rotate_left(13))
+        .wrapping_add(0xA11C_E5D5)
 }
 
 fn is_retryable_ingest_error(err: &DBError) -> bool {
@@ -1662,6 +3391,7 @@ pub(crate) fn build_artifact(
         benchmark_id: BENCH_ID,
         run_id: run_id.to_string(),
         generated_at_unix_ms: unix_epoch_ms(),
+        topology: BenchmarkTopologyArtifact::from_env()?,
         config: config.artifact(),
         scenarios: scenario_artifacts,
     })
@@ -1727,6 +3457,9 @@ pub(crate) fn print_directional_report(artifact: &BenchmarkArtifact, config: &Re
     eprintln!("  Scenario Set: compaction.read_baseline vs compaction.read_compaction_quiesced");
     eprintln!("  Dataset Scale: {}", config.dataset_scale);
     eprintln!("  Backend: {}", config.backend.as_str());
+    if let Some(summary) = artifact.topology.summary_line() {
+        eprintln!("  Topology: {summary}");
+    }
     eprintln!(
         "  Latency (ns): baseline(mean={:.2}, p50={}, p95={}, p99={}) quiesced(mean={:.2}, \
          p50={}, p95={}, p99={})",
@@ -1977,6 +3710,21 @@ pub(crate) fn benchmark_schema() -> SchemaRef {
     ]))
 }
 
+pub(crate) fn swmr_benchmark_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
+}
+
+pub(crate) fn swmr_light_projection_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]))
+}
+
 pub(crate) fn scenario_root(run_id: &str, scenario_id: &str) -> PathBuf {
     PathBuf::from("target")
         .join("tonbo-bench")
@@ -2074,6 +3822,26 @@ pub(crate) async fn snapshot_object_store_storage_volume(
     snapshot_storage_volume_with_fs(fs.as_ref(), &root).await
 }
 
+pub(crate) async fn cleanup_local_storage_volume(root: &Path) -> Result<(), BenchError> {
+    let fs = LocalFs {};
+    let absolute = absolutize(root)?;
+    let root_path = FusioPath::from_filesystem_path(&absolute).map_err(|err| {
+        BenchError::Message(format!(
+            "failed to convert benchmark root `{}` to fusio path: {err}",
+            absolute.display()
+        ))
+    })?;
+    cleanup_storage_root_with_fs(&fs, &root_path).await
+}
+
+pub(crate) async fn cleanup_object_store_storage_volume(
+    object_spec: &ObjectSpec,
+) -> Result<(), BenchError> {
+    let probe = IoProbe::default();
+    let (fs, root) = build_probed_object_store_fs(object_spec, &probe)?;
+    cleanup_storage_root_with_fs(fs.as_ref(), &root).await
+}
+
 pub(crate) async fn snapshot_storage_target_volume(
     target: &ScenarioStorageTarget,
 ) -> Result<StorageVolumeArtifact, BenchError> {
@@ -2161,6 +3929,9 @@ fn build_probed_object_store_fs(
         token: spec.credentials.session_token.clone(),
     };
     builder = builder.credential(credential);
+    if let Some(s3_express) = spec.s3_express {
+        builder = builder.s3_express(s3_express);
+    }
     if let Some(sign) = spec.sign_payload {
         builder = builder.sign_payload(sign);
     }
@@ -2246,6 +4017,50 @@ async fn snapshot_storage_volume_with_fs<FS: Fs>(
     Ok(volume)
 }
 
+async fn cleanup_storage_root_with_fs<FS: Fs>(fs: &FS, root: &FusioPath) -> Result<(), BenchError> {
+    let mut pending = VecDeque::new();
+    let mut visited = HashSet::new();
+    let mut files = Vec::new();
+    pending.push_back(root.clone());
+    while let Some(dir) = pending.pop_front() {
+        if !visited.insert(dir.to_string()) {
+            continue;
+        }
+        let stream = fs.list(&dir).await.map_err(|err| {
+            BenchError::Message(format!(
+                "failed to list storage for cleanup under `{}`: {err}",
+                dir.as_ref()
+            ))
+        })?;
+        futures::pin_mut!(stream);
+        while let Some(meta_result) = stream.next().await {
+            let meta = meta_result.map_err(|err| {
+                BenchError::Message(format!(
+                    "failed to read storage metadata for cleanup under `{}`: {err}",
+                    dir.as_ref()
+                ))
+            })?;
+            if is_probably_file_path(meta.path.as_ref()) {
+                files.push(meta.path);
+            } else {
+                pending.push_back(meta.path);
+            }
+        }
+    }
+
+    files.sort_by(|left, right| right.as_ref().cmp(left.as_ref()));
+    for path in files {
+        fs.remove(&path).await.map_err(|err| {
+            BenchError::Message(format!(
+                "failed to remove benchmark artifact `{}`: {err}",
+                path.as_ref()
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
 fn is_probably_file_path(path: &str) -> bool {
     let Some(name) = path.rsplit('/').next() else {
         return false;
@@ -2273,6 +4088,30 @@ pub(crate) async fn ingest_workload(
             config.key_space,
             config.seed,
             batch_idx,
+        )?;
+        match db {
+            BenchmarkDb::Local(inner) => inner.ingest(batch).await?,
+            BenchmarkDb::ObjectStore(inner) => inner.ingest(batch).await?,
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn preload_swmr_workload(
+    db: &BenchmarkDb,
+    schema: &SchemaRef,
+    rows_per_batch: usize,
+    payload_bytes: usize,
+    preload_batches: usize,
+    seed: u64,
+) -> Result<(), BenchError> {
+    for batch_idx in 0..preload_batches {
+        let batch = build_swmr_preload_batch(
+            schema,
+            rows_per_batch,
+            payload_bytes,
+            u64::try_from(batch_idx).unwrap_or(u64::MAX),
+            seed,
         )?;
         match db {
             BenchmarkDb::Local(inner) => inner.ingest(batch).await?,
@@ -2311,7 +4150,49 @@ fn build_batch(
     .map_err(BenchError::from)
 }
 
-fn deterministic_key_slot(global_idx: usize, key_space: usize, seed: u64) -> usize {
+fn build_swmr_preload_batch(
+    schema: &SchemaRef,
+    rows_per_batch: usize,
+    payload_bytes: usize,
+    batch_idx: u64,
+    seed: u64,
+) -> Result<RecordBatch, BenchError> {
+    let mut ids = Vec::with_capacity(rows_per_batch);
+    let mut values = Vec::with_capacity(rows_per_batch);
+    let mut payloads = Vec::with_capacity(rows_per_batch);
+
+    for row_idx in 0..rows_per_batch {
+        let ordinal = batch_idx
+            .saturating_mul(u64::try_from(rows_per_batch).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(row_idx).unwrap_or(u64::MAX));
+        let key_idx = usize::try_from(ordinal).unwrap_or(usize::MAX);
+        ids.push(swmr_preload_key(key_idx));
+        values.push(i64::try_from(deterministic_mix_u64(ordinal, seed)).unwrap_or(i64::MAX));
+        payloads.push(swmr_payload(payload_bytes, ordinal));
+    }
+
+    RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(StringArray::from(ids)) as _,
+            Arc::new(Int64Array::from(values)) as _,
+            Arc::new(StringArray::from(payloads)) as _,
+        ],
+    )
+    .map_err(BenchError::from)
+}
+
+fn swmr_preload_key(index: usize) -> String {
+    if index < 16_384 {
+        format!("hot-{index:08}")
+    } else if index < 49_152 {
+        format!("warm-{:08}", index - 16_384)
+    } else {
+        format!("cold-{:08}", index - 49_152)
+    }
+}
+
+pub(crate) fn deterministic_key_slot(global_idx: usize, key_space: usize, seed: u64) -> usize {
     if key_space <= 1 {
         return 0;
     }
@@ -2539,6 +4420,8 @@ fn measure_scenario(
         let mut latencies_ns = Vec::with_capacity(iterations);
         let mut rows_processed = 0u64;
         let mut read_path = ReadPathAggregate::default();
+        let mut swmr = SwmrAggregate::default();
+        let mut surface = SurfaceAggregate::default();
         let mut physical_stale_estimate = None;
         let started = Instant::now();
         for _ in 0..iterations {
@@ -2547,6 +4430,12 @@ fn measure_scenario(
             rows_processed = rows_processed.saturating_add(usize_to_u64(result.rows));
             if let Some(breakdown) = result.read_path {
                 read_path.record(breakdown);
+            }
+            if let Some(swmr_result) = result.swmr {
+                swmr.record(swmr_result);
+            }
+            if let Some(surface_result) = result.surface {
+                surface.record(surface_result);
             }
             if let Some(estimate) = result.physical_stale_estimate {
                 physical_stale_estimate = Some(estimate);
@@ -2566,6 +4455,16 @@ fn measure_scenario(
             },
             physical_stale_estimate,
             io: scenario.io_probe.snapshot(),
+            swmr: if !swmr.writer_latencies_ns.is_empty() || !swmr.readers.is_empty() {
+                Some(swmr)
+            } else {
+                None
+            },
+            surface: if !surface.snapshot_latencies_ns.is_empty() {
+                Some(surface)
+            } else {
+                None
+            },
         })
     })
 }
@@ -2640,6 +4539,17 @@ fn to_scenario_artifact(
             ),
             gc_observation: scenario.gc_observation.clone(),
             io: scenario.setup_io.clone(),
+            swmr: scenario
+                .swmr_state
+                .as_ref()
+                .map(SwmrWorkloadState::setup_descriptor),
+            surface: scenario
+                .surface_state
+                .as_ref()
+                .map(|state| SurfaceSetupDescriptor {
+                    light_scan_limit: state.light_scan_limit,
+                    heavy_scan_limit: state.heavy_scan_limit,
+                }),
         },
         summary: ScenarioSummaryArtifact {
             iterations: measurement.iterations,
@@ -2653,6 +4563,16 @@ fn to_scenario_artifact(
             physical_stale_estimate: measurement.physical_stale_estimate,
             gc,
             io: measurement.io,
+            swmr: measurement.swmr.as_ref().and_then(|swmr| {
+                scenario
+                    .swmr_state
+                    .as_ref()
+                    .and_then(|state| swmr.to_summary(state))
+            }),
+            surface: measurement
+                .surface
+                .as_ref()
+                .and_then(SurfaceAggregate::to_summary),
         },
     }
 }
@@ -2929,6 +4849,49 @@ fn env_backend(name: &'static str, default: BenchBackend) -> Result<BenchBackend
         Err(err) => Err(BenchError::Message(format!(
             "failed reading environment variable `{name}`: {err}"
         ))),
+    }
+}
+
+fn env_optional_trimmed(name: &'static str) -> Result<Option<String>, BenchError> {
+    match env::var(name) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(BenchError::Message(format!(
+            "failed reading environment variable `{name}`: {err}"
+        ))),
+    }
+}
+
+fn env_optional_f64(name: &'static str) -> Result<Option<f64>, BenchError> {
+    match env::var(name) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let value = trimmed.parse::<f64>().map_err(|_| BenchError::InvalidEnv {
+                name,
+                value: raw.clone(),
+            })?;
+            Ok(Some(value))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(BenchError::Message(format!(
+            "failed reading environment variable `{name}`: {err}"
+        ))),
+    }
+}
+
+fn push_topology_field(fields: &mut Vec<String>, label: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        fields.push(format!("{label}={value}"));
     }
 }
 
